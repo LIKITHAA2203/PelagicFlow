@@ -1,0 +1,6 @@
+{
+  "name": "PelagicFlow",
+  "description": "Satellite-to-Sea AI plastic plume drift predictor and autonomous ocean cleanup vessel router powered by real-time Open-Meteo Marine telemetry and Graph Neural Network advection.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
