@@ -53,11 +53,11 @@ def velocity_to_uv(speed_kmh: float, direction_deg: float) -> Tuple[float, float
 class OceanPlasticSpatiotemporalGNN(nn.Module):
     """
     Message-passing Graph Neural Network (SAGEConv + GCNConv) + LSTM recurrent cell
-    predicting ocean node states [lat, lon, u_current, v_current, plastic_concentration]
+    predicting ocean node states [lat, lon, u_current, v_current, plastic_concentration, s2_fdi_score]
     at t+24h, t+48h, and t+72h.
     """
 
-    def __init__(self, in_channels: int = 5, hidden_dim: int = 64):
+    def __init__(self, in_channels: int = 6, hidden_dim: int = 64):
         super().__init__()
         self.input_proj = nn.Linear(in_channels, hidden_dim)
         self.sage1 = SAGEConv(hidden_dim, hidden_dim, aggr="mean")
@@ -119,6 +119,7 @@ class OceanPlasticSpatiotemporalGNN(nn.Module):
 
         # Normalize features for message passing stability
         lat_mean, lon_mean = x[:, 0].mean(), x[:, 1].mean()
+        s2_fdi = x[:, 5] if x.shape[1] > 5 else torch.zeros_like(x[:, 4])
         x_norm = torch.stack(
             [
                 (x[:, 0] - lat_mean) / 10.0,
@@ -126,6 +127,7 @@ class OceanPlasticSpatiotemporalGNN(nn.Module):
                 x[:, 2],
                 x[:, 3],
                 x[:, 4],
+                s2_fdi,
             ],
             dim=-1,
         )

@@ -4,6 +4,18 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import {
+  addUserFeedback,
+  loadFeedbackRecords,
+  loadModelWeights,
+  runModelFineTuning,
+  type FeedbackType,
+  type RoutingStrategy,
+} from './src/server/feedbackEngine.ts';
+import {
+  simulateAutonomousFleet,
+  type VesselClassId,
+} from './src/server/fleetSimulator.ts';
+import {
   ACCUMULATION_ZONES,
   OPEN_METEO_MARINE_URL,
   runRealMarinePrediction,
@@ -14,12 +26,29 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const portArgIdx = process.argv.indexOf('--port');
 const cliPort = portArgIdx !== -1 ? Number(process.argv[portArgIdx + 1]) : NaN;
-const PORT = Number.isFinite(cliPort) ? cliPort : Number(process.env.DEFAULT_APP_PORT || process.env.PORT || 3000);
+const PORT = Number.isFinite(cliPort)
+  ? cliPort
+  : Number(process.env.DEFAULT_APP_PORT || process.env.PORT || 3000);
 const FASTAPI_URL = (process.env.FASTAPI_URL || '').trim().replace(/\/$/, '');
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({ limit: '2mb' }));
+
+  // Periodic background fine-tuning loop (runs every 5 minutes if new feedback exists)
+  const fineTuneTimer = setInterval(() => {
+    try {
+      const res = runModelFineTuning(false);
+      if (res.trained) {
+        console.log(
+          `[PelagicFlow] Periodic GNN fine-tuning v${res.weights.version}: MSE ${res.mseBefore} -> ${res.mseAfter}`
+        );
+      }
+    } catch {
+      // Non-fatal periodic trainer guard
+    }
+  }, 5 * 60 * 1000);
+  fineTuneTimer.unref();
 
   app.get('/api/health', async (_req, res) => {
     const t0 = performance.now();
@@ -46,7 +75,7 @@ async function startServer() {
       const latencyMs = Number((performance.now() - t0).toFixed(1));
       return res.json({
         status: 'online',
-        engine: 'spatial-gnn-rk4-node',
+        engine: 'spatial-gnn-rk4-sentinel2',
         openMeteoStatus: 'connected',
         latencyMs,
       });
@@ -54,7 +83,7 @@ async function startServer() {
       const msg = err instanceof Error ? err.message : 'Unknown error';
       return res.status(502).json({
         status: 'degraded',
-        engine: 'spatial-gnn-rk4-node',
+        engine: 'spatial-gnn-rk4-sentinel2',
         openMeteoStatus: msg,
         latencyMs: null,
       });
@@ -94,6 +123,8 @@ async function startServer() {
       vesselLon: Number.isFinite(Number(body.vesselLon)) ? Number(body.vesselLon) : (lonMin + lonMax) / 2,
       vesselSpeedKnots: Number(body.vesselSpeedKnots || 10),
       leewayFactor: Number.isFinite(Number(body.leewayFactor)) ? Number(body.leewayFactor) : 0.02,
+      fleetSize: Number.isFinite(Number(body.fleetSize)) ? Number(body.fleetSize) : 2,
+      vesselClass: (body.vesselClass as VesselClassId) || 'autonomous_sweeper',
       forceRefresh: Boolean(body.forceRefresh),
     };
 
@@ -110,7 +141,7 @@ async function startServer() {
           return res.json(data);
         }
       } catch {
-        // Fallback to direct real Open-Meteo pipeline
+        // Fallback to direct real Open-Meteo + Sentinel-2 pipeline
       }
     }
 
@@ -121,6 +152,64 @@ async function startServer() {
       const msg = err instanceof Error ? err.message : 'Prediction pipeline error';
       return res.status(502).json({ error: msg });
     }
+  });
+
+  app.get('/api/feedback', (_req, res) => {
+    res.json({
+      feedback: loadFeedbackRecords(),
+      weights: loadModelWeights(),
+    });
+  });
+
+  app.post('/api/feedback', (req, res) => {
+    const b = req.body || {};
+    const lat = Number(b.lat);
+    const lon = Number(b.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return res.status(400).json({ error: 'Valid latitude and longitude are required.' });
+    }
+
+    const record = addUserFeedback({
+      regionId: String(b.regionId || 'gpgp'),
+      feedbackType: (b.feedbackType as FeedbackType) || 'density_discrepancy',
+      lat,
+      lon,
+      predictedIndex: Number.isFinite(Number(b.predictedIndex)) ? Number(b.predictedIndex) : 0.5,
+      observedIndex: Number.isFinite(Number(b.observedIndex)) ? Number(b.observedIndex) : 0.5,
+      preferredRoutingStrategy: (b.preferredRoutingStrategy as RoutingStrategy) || 'balanced',
+      notes: String(b.notes || ''),
+    });
+
+    res.json({
+      record,
+      feedbackCount: loadFeedbackRecords().length,
+      weights: loadModelWeights(),
+    });
+  });
+
+  app.post('/api/model/finetune', (req, res) => {
+    const force = Boolean(req.body?.force ?? true);
+    const result = runModelFineTuning(force);
+    res.json(result);
+  });
+
+  app.post('/api/simulate-fleet', (req, res) => {
+    const b = req.body || {};
+    if (!b.horizons || !Array.isArray(b.waypoints)) {
+      return res.status(400).json({ error: 'Horizons and waypoints are required for fleet simulation.' });
+    }
+    const sim = simulateAutonomousFleet(
+      {
+        fleetSize: Number(b.fleetSize || 2),
+        vesselClass: (b.vesselClass as VesselClassId) || 'autonomous_sweeper',
+        horizonHours: Number(b.horizonHours || 72),
+        originLat: Number(b.originLat || 0),
+        originLon: Number(b.originLon || 0),
+      },
+      b.horizons,
+      b.waypoints
+    );
+    res.json(sim);
   });
 
   app.get('/api/backend-files', (_req, res) => {
@@ -148,8 +237,6 @@ async function startServer() {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   } else {
-    // Serve a WebSocket-free /@vite/client implementation when HMR is disabled
-    // so Vite 8 middlewareMode does not attempt failing WS connections behind proxies.
     app.get('/@vite/client', (_req, res) => {
       res.type('application/javascript').send(`
 const sheetsMap = new Map();

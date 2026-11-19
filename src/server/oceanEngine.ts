@@ -1,15 +1,23 @@
-export interface AccumulationZone {
-  id: string;
-  name: string;
-  basin: string;
-  latMin: number;
-  latMax: number;
-  lonMin: number;
-  lonMax: number;
-  defaultVesselLat: number;
-  defaultVesselLon: number;
-  description: string;
-}
+import { loadModelWeights, type TunableModelWeights } from './feedbackEngine.ts';
+import {
+  simulateAutonomousFleet,
+  type FleetSimulationResult,
+  type VesselClassId,
+} from './fleetSimulator.ts';
+import {
+  analyzeSentinel2ForGrid,
+  type SentinelAnalysisResult,
+} from './sentinelProcessor.ts';
+import type {
+  AccumulationZone,
+  GraphEdge,
+  HorizonNodeRecord,
+  HorizonSnapshot,
+  PlumeTrajectory,
+  PredictionResponse,
+  TrajectoryPoint,
+  VesselWaypoint,
+} from '../types/ocean.ts';
 
 export interface PredictParams {
   regionId: string;
@@ -22,6 +30,8 @@ export interface PredictParams {
   vesselLon: number;
   vesselSpeedKnots: number;
   leewayFactor?: number;
+  fleetSize?: number;
+  vesselClass?: VesselClassId;
   forceRefresh?: boolean;
 }
 
@@ -42,101 +52,6 @@ export interface OceanNodeObs {
   waveDirSeries: number[];
 }
 
-export interface GraphEdge {
-  source: number;
-  target: number;
-  weight: number;
-}
-
-export interface HorizonNodeRecord {
-  id: number;
-  gridLat: number;
-  gridLon: number;
-  lat: number;
-  lon: number;
-  u: number;
-  v: number;
-  speedMs: number;
-  directionDeg: number;
-  windSpeedMs: number;
-  windDirectionDeg: number;
-  sst: number;
-  waveHeight: number;
-  waveDirection: number;
-  convergenceIndex: number;
-}
-
-export interface HorizonSnapshot {
-  timestamp: string;
-  nodes: HorizonNodeRecord[];
-  meanSpeedMs: number;
-  meanWindMs: number;
-  meanSstC: number;
-  meanWaveM: number;
-  peakConvergence: number;
-}
-
-export interface TrajectoryPoint {
-  hour: number;
-  lat: number;
-  lon: number;
-}
-
-export interface PlumeTrajectory {
-  nodeId: number;
-  initialConvergence: number;
-  points: TrajectoryPoint[];
-}
-
-export interface VesselWaypoint {
-  order: number;
-  horizonHour: number;
-  lat: number;
-  lon: number;
-  convergenceIndex: number;
-  sst: number;
-  legDistanceNm: number;
-  etaHours: number;
-  bearingDeg: number;
-}
-
-export interface SentinelScene {
-  id: string;
-  datetime: string;
-  cloudCover: number;
-  mgrsTile: string;
-  platform: string;
-  bbox: [number, number, number, number];
-  coordinates: number[][][];
-  thumbnailUrl?: string;
-}
-
-export interface PredictionResponse {
-  meta: {
-    engine: string;
-    dataSources: string[];
-    fetchTimeMs: number;
-    cached: boolean;
-    nodeCount: number;
-    edgeCount: number;
-    forecastIssuedUtc: string;
-    leewayFactor: number;
-    sentinelSceneCount: number;
-  };
-  graphEdges: GraphEdge[];
-  horizons: Record<string, HorizonSnapshot>;
-  trajectories: PlumeTrajectory[];
-  sentinelScenes: SentinelScene[];
-  vesselRoute: {
-    origin: { lat: number; lon: number };
-    speedKnots: number;
-    totalDistanceNm: number;
-    totalEtaHours: number;
-    meanTargetConvergence: number;
-    waypoints: VesselWaypoint[];
-  };
-}
-
 const EARTH_RADIUS_M = 6_371_000.0;
 const KMH_TO_MS = 1.0 / 3.6;
 const NM_PER_METER = 1.0 / 1852.0;
@@ -147,7 +62,6 @@ export const OPEN_METEO_MARINE_URL =
     ? rawMarineEnv
     : 'https://marine-api.open-meteo.com/v1/marine';
 export const OPEN_METEO_WEATHER_URL = 'https://api.open-meteo.com/v1/forecast';
-export const SENTINEL_STAC_URL = 'https://earth-search.aws.element84.com/v1/search';
 
 export const ACCUMULATION_ZONES: AccumulationZone[] = [
   {
@@ -221,7 +135,7 @@ interface CachedMarineGrid {
   fetchedAt: number;
   timestamps: string[];
   nodes: OceanNodeObs[];
-  sentinelScenes: SentinelScene[];
+  sentinel: SentinelAnalysisResult;
 }
 
 const marineCache = new Map<string, CachedMarineGrid>();
@@ -249,14 +163,12 @@ function initialBearingDeg(lat1: number, lon1: number, lat2: number, lon2: numbe
   return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
 }
 
-/** Open-Meteo ocean_current_direction is towards-direction (deg clockwise from North). */
 function currentToUV(speedKmh: number, towardsDeg: number): [number, number] {
   const speedMs = speedKmh * KMH_TO_MS;
   const rad = (towardsDeg * Math.PI) / 180;
   return [speedMs * Math.sin(rad), speedMs * Math.cos(rad)];
 }
 
-/** Open-Meteo wind_direction_10m is meteorological FROM-direction; downwind vector adds 180°. */
 function windFromToUV(speedKmh: number, fromDeg: number): [number, number] {
   const speedMs = speedKmh * KMH_TO_MS;
   const rad = (((fromDeg + 180) % 360) * Math.PI) / 180;
@@ -276,7 +188,9 @@ function minmaxNorm(arr: number[]): number[] {
 
 function computePhysicalConvergenceIndex(
   nodes: OceanNodeObs[],
-  leewayFactor: number
+  leewayFactor: number,
+  nodeFdiScores: number[],
+  weights: TunableModelWeights
 ): number[] {
   const n = nodes.length;
   if (n === 0) return [];
@@ -327,9 +241,21 @@ function computePhysicalConvergenceIndex(
   const sstNorm = minmaxNorm(sstGrad);
   const stagNorm = minmaxNorm(stagnation);
 
+  // Fuse hydrodynamic convergence + SST fronts + stagnation + aligned Sentinel-2 spectral FDI
+  const hasFdi = nodeFdiScores.some((s) => s > 0.01);
+  const fdiWeight = hasFdi ? weights.wSentinelFdi : 0;
+  const hydroSum = weights.wConvergence + weights.wSstFront + weights.wStagnation;
+  const totalW = Math.max(0.1, hydroSum + fdiWeight);
+
   return nodes.map((_, i) => {
-    const score = 0.55 * convNorm[i] + 0.25 * sstNorm[i] + 0.2 * stagNorm[i];
-    return Math.min(0.98, Math.max(0.05, 0.08 + 0.88 * score));
+    const fdi = nodeFdiScores[i] ?? 0;
+    const rawScore =
+      (weights.wConvergence * convNorm[i] +
+        weights.wSstFront * sstNorm[i] +
+        weights.wStagnation * stagNorm[i] +
+        fdiWeight * fdi) /
+      totalW;
+    return Math.min(0.98, Math.max(0.05, 0.08 + 0.88 * rawScore));
   });
 }
 
@@ -386,8 +312,10 @@ function buildSpatialOceanGraph(
 function runGraphMessagePassingRollout(
   nodes: OceanNodeObs[],
   conc0: number[],
+  nodeFdiScores: number[],
   edges: GraphEdge[],
-  leewayFactor: number
+  leewayFactor: number,
+  weights: TunableModelWeights
 ): Array<Array<{ lat: number; lon: number; u: number; v: number; concentration: number }>> {
   const n = nodes.length;
   const horizonHours = [24, 48, 72];
@@ -400,8 +328,11 @@ function runGraphMessagePassingRollout(
     concentration: conc0[i],
   }));
 
-  const hidden = nodes.map((_, i) => [current[i].u, current[i].v, conc0[i]]);
+  const hidden = nodes.map((_, i) => [current[i].u, current[i].v, conc0[i], nodeFdiScores[i] ?? 0]);
   const predictions: Array<Array<{ lat: number; lon: number; u: number; v: number; concentration: number }>> = [];
+
+  const inputGate = Math.min(0.55, Math.max(0.20, weights.gnnAdvectionMix));
+  const forgetGate = 1.0 - inputGate;
 
   for (const hVal of horizonHours) {
     const incomingFlux = new Array<number>(n).fill(0);
@@ -426,15 +357,14 @@ function runGraphMessagePassingRollout(
       const msgU = deg > 1e-6 ? neighborU[i] / deg : current[i].u;
       const msgV = deg > 1e-6 ? neighborV[i] / deg : current[i].v;
 
-      const forgetGate = 0.64;
-      const inputGate = 0.36;
       hidden[i][0] = forgetGate * hidden[i][0] + inputGate * (0.7 * uNext + 0.3 * msgU);
       hidden[i][1] = forgetGate * hidden[i][1] + inputGate * (0.7 * vNext + 0.3 * msgV);
 
       const flowShear = Math.tanh((Math.hypot(msgU, msgV) - Math.hypot(uNext, vNext)) * 1.5) * 0.04;
+      const fdiPrior = (hidden[i][3] ?? 0) * 0.05;
       const nextConc = Math.min(
         0.99,
-        Math.max(0.03, forgetGate * current[i].concentration + inputGate * advectedConc + flowShear)
+        Math.max(0.03, forgetGate * current[i].concentration + inputGate * advectedConc + flowShear + fdiPrior)
       );
       hidden[i][2] = nextConc;
 
@@ -491,7 +421,6 @@ function interpolateEffectiveUvAt(
     const uWind = nd.windUSeries[s0] * (1 - alpha) + nd.windUSeries[s1] * alpha;
     const vWind = nd.windVSeries[s0] * (1 - alpha) + nd.windVSeries[s1] * alpha;
 
-    // Wave direction is FROM-direction; Stokes drift propagates towards (waveDir + 180)
     const wh = nd.waveHSeries[s0] * (1 - alpha) + nd.waveHSeries[s1] * alpha;
     const wdTowards = (((nd.waveDirSeries[s0] + 180) % 360) * Math.PI) / 180;
     const stokes = 0.015 * wh;
@@ -547,7 +476,8 @@ function optimizeVesselRoute(
   vesselLat: number,
   vesselLon: number,
   speedKnots: number,
-  horizons: Record<string, HorizonSnapshot>
+  horizons: Record<string, HorizonSnapshot>,
+  weights: TunableModelWeights
 ): VesselWaypoint[] {
   const candidates: Array<{
     horizonHour: number;
@@ -591,8 +521,11 @@ function optimizeVesselRoute(
       const distNm = haversineMeters(currLat, currLon, cand.lat, cand.lon) * NM_PER_METER;
       const legHrs = distNm / Math.max(1, speedKnots);
       const etaHrs = elapsedHrs + legHrs;
-      const horizonPenalty = 1 + Math.abs(etaHrs - cand.horizonHour) / 36;
-      const score = (cand.convergenceIndex * 100) / ((1 + legHrs * 0.15) * horizonPenalty);
+      const horizonPenalty =
+        1 + (Math.abs(etaHrs - cand.horizonHour) / 36) * weights.routeHorizonPenaltyWeight;
+      const score =
+        (Math.pow(cand.convergenceIndex, weights.routeYieldWeight) * 100) /
+        ((1 + legHrs * weights.routeDistancePenalty) * horizonPenalty);
 
       if (score > bestScore) {
         bestScore = score;
@@ -625,67 +558,26 @@ function optimizeVesselRoute(
   return selected;
 }
 
-async function fetchSentinelScenes(
-  latMin: number,
-  latMax: number,
-  lonMin: number,
-  lonMax: number
-): Promise<SentinelScene[]> {
-  try {
-    const resp = await fetch(SENTINEL_STAC_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        collections: ['sentinel-2-l2a'],
-        bbox: [lonMin, latMin, lonMax, latMax],
-        limit: 6,
-      }),
-      signal: AbortSignal.timeout(7000),
-    });
-    if (!resp.ok) return [];
-    const data = (await resp.json()) as { features?: any[] };
-    const features = Array.isArray(data.features) ? data.features : [];
-    return features
-      .filter((f) => f?.geometry?.type === 'Polygon' && Array.isArray(f?.geometry?.coordinates))
-      .map((f) => {
-        const props = f.properties || {};
-        const gridCode =
-          props['grid:code'] ||
-          (props['mgrs:utm_zone']
-            ? `${props['mgrs:utm_zone']}${props['mgrs:latitude_band'] || ''}${props['mgrs:grid_square'] || ''}`
-            : 'S2');
-        return {
-          id: String(f.id || ''),
-          datetime: String(props.datetime || ''),
-          cloudCover: Number((props['eo:cloud_cover'] ?? 0).toFixed(1)),
-          mgrsTile: String(gridCode),
-          platform: String(props.platform || 'sentinel-2'),
-          bbox: (f.bbox || [lonMin, latMin, lonMax, latMax]) as [number, number, number, number],
-          coordinates: f.geometry.coordinates as number[][][],
-          thumbnailUrl: f.assets?.thumbnail?.href,
-        };
-      });
-  } catch {
-    return [];
-  }
-}
-
 export async function runRealMarinePrediction(params: PredictParams): Promise<PredictionResponse> {
   const t0 = performance.now();
+  const weights = loadModelWeights();
   const gridSize = Math.min(8, Math.max(4, Math.round(params.gridSize || 6)));
-  const leewayFactor = Math.min(0.06, Math.max(0, Number(params.leewayFactor ?? 0.02)));
+  const baseLeeway = Math.min(0.06, Math.max(0, Number(params.leewayFactor ?? 0.02)));
+  const calibratedLeeway = Number((baseLeeway * weights.leewayCalibrationScale).toFixed(4));
   const cacheKey = `${params.latMin.toFixed(3)}:${params.latMax.toFixed(3)}:${params.lonMin.toFixed(3)}:${params.lonMax.toFixed(3)}:${gridSize}`;
 
   let oceanNodes: OceanNodeObs[] = [];
   let timestamps: string[] = [];
-  let sentinelScenes: SentinelScene[] = [];
+  let sentinelResult: SentinelAnalysisResult;
   let cachedHit = false;
+  let fetchedAtMs = Date.now();
 
   const existing = marineCache.get(cacheKey);
   if (!params.forceRefresh && existing && Date.now() - existing.fetchedAt < CACHE_TTL_MS) {
     oceanNodes = existing.nodes;
     timestamps = existing.timestamps;
-    sentinelScenes = existing.sentinelScenes;
+    sentinelResult = existing.sentinel;
+    fetchedAtMs = existing.fetchedAt;
     cachedHit = true;
   } else {
     const lats: number[] = [];
@@ -718,17 +610,14 @@ export async function runRealMarinePrediction(params: PredictParams): Promise<Pr
       timezone: 'UTC',
     });
 
-    const [marineRes, windRes, s2Scenes] = await Promise.all([
+    const [marineRes, windRes] = await Promise.all([
       fetch(`${OPEN_METEO_MARINE_URL}?${marineQuery.toString()}`, {
         signal: AbortSignal.timeout(20_000),
       }),
       fetch(`${OPEN_METEO_WEATHER_URL}?${windQuery.toString()}`, {
         signal: AbortSignal.timeout(20_000),
       }).catch(() => null),
-      fetchSentinelScenes(params.latMin, params.latMax, params.lonMin, params.lonMax),
     ]);
-
-    sentinelScenes = s2Scenes;
 
     if (!marineRes.ok) {
       const errText = await marineRes.text();
@@ -758,7 +647,7 @@ export async function runRealMarinePrediction(params: PredictParams): Promise<Pr
       const wdArr: Array<number | null> = hourly.wave_direction || [];
 
       if (velArr.length === 0 || velArr[0] === null || sstArr[0] === null) {
-        return; // Land cell
+        return;
       }
 
       const windHourly = windItems[idx]?.hourly;
@@ -821,17 +710,39 @@ export async function runRealMarinePrediction(params: PredictParams): Promise<Pr
       );
     }
 
+    // Ingest & spectrally process Sentinel-2 L2A COG scenes, aligned to oceanNodes
+    sentinelResult = await analyzeSentinel2ForGrid(
+      params.latMin,
+      params.latMax,
+      params.lonMin,
+      params.lonMax,
+      oceanNodes
+    );
+
+    fetchedAtMs = Date.now();
     marineCache.set(cacheKey, {
-      fetchedAt: Date.now(),
+      fetchedAt: fetchedAtMs,
       timestamps,
       nodes: oceanNodes,
-      sentinelScenes,
+      sentinel: sentinelResult,
     });
   }
 
-  const conc0 = computePhysicalConvergenceIndex(oceanNodes, leewayFactor);
-  const { edges } = buildSpatialOceanGraph(oceanNodes, leewayFactor);
-  const rolloutPreds = runGraphMessagePassingRollout(oceanNodes, conc0, edges, leewayFactor);
+  const conc0 = computePhysicalConvergenceIndex(
+    oceanNodes,
+    calibratedLeeway,
+    sentinelResult.nodeFdiScores,
+    weights
+  );
+  const { edges } = buildSpatialOceanGraph(oceanNodes, calibratedLeeway);
+  const rolloutPreds = runGraphMessagePassingRollout(
+    oceanNodes,
+    conc0,
+    sentinelResult.nodeFdiScores,
+    edges,
+    calibratedLeeway,
+    weights
+  );
 
   const rankedIndices = oceanNodes
     .map((_, idx) => ({ idx, c: conc0[idx] }))
@@ -845,7 +756,7 @@ export async function runRealMarinePrediction(params: PredictParams): Promise<Pr
       oceanNodes[idx].lat,
       oceanNodes[idx].lon,
       oceanNodes,
-      leewayFactor,
+      calibratedLeeway,
       72,
       3
     ),
@@ -880,6 +791,7 @@ export async function runRealMarinePrediction(params: PredictParams): Promise<Pr
         waveHeight: Number(nd.waveHSeries[fIdx].toFixed(2)),
         waveDirection: Number(nd.waveDirSeries[fIdx].toFixed(1)),
         convergenceIndex: Number(predState.concentration.toFixed(3)),
+        s2FdiScore: sentinelResult.nodeFdiScores[nIdx] ?? 0,
       };
     });
 
@@ -899,7 +811,20 @@ export async function runRealMarinePrediction(params: PredictParams): Promise<Pr
     params.vesselLat,
     params.vesselLon,
     params.vesselSpeedKnots,
-    horizons
+    horizons,
+    weights
+  );
+
+  const fleetSimulation: FleetSimulationResult = simulateAutonomousFleet(
+    {
+      fleetSize: params.fleetSize ?? 2,
+      vesselClass: params.vesselClass ?? 'autonomous_sweeper',
+      horizonHours: 72,
+      originLat: params.vesselLat,
+      originLon: params.vesselLon,
+    },
+    horizons,
+    waypoints
   );
 
   const totalDistanceNm = Number(waypoints.reduce((s, w) => s + w.legDistanceNm, 0).toFixed(1));
@@ -909,26 +834,42 @@ export async function runRealMarinePrediction(params: PredictParams): Promise<Pr
       ? Number((waypoints.reduce((s, w) => s + w.convergenceIndex, 0) / waypoints.length).toFixed(3))
       : 0;
 
+  const latestSentinelUtc =
+    sentinelResult.scenes.length > 0
+      ? sentinelResult.scenes
+          .map((s) => s.datetime)
+          .filter(Boolean)
+          .sort()
+          .pop() || null
+      : null;
+
   return {
     meta: {
-      engine: 'Spatial Graph Message-Passing + Recurrent LSTM + RK4 Advection',
+      engine: 'Spatial Graph Message-Passing + Sentinel-2 FDI Fusion + RK4 Advection',
       dataSources: [
         'Open-Meteo Marine (Copernicus / Mercator Ocean Currents, SST, Waves)',
         'Open-Meteo Atmosphere (10m Wind Leeway)',
-        'Element84 Earth Search STAC (Sentinel-2 L2A Swaths)',
+        'Element84 STAC + AWS S3 COGs (Sentinel-2 L2A B04/B06/B08/B11/SCL)',
       ],
       fetchTimeMs: Number((performance.now() - t0).toFixed(1)),
       cached: cachedHit,
       nodeCount: oceanNodes.length,
       edgeCount: edges.length,
       forecastIssuedUtc: timestamps[0] || '',
-      leewayFactor,
-      sentinelSceneCount: sentinelScenes.length,
+      ingestedAtUtc: new Date(fetchedAtMs).toISOString(),
+      latestSentinelUtc,
+      leewayFactor: calibratedLeeway,
+      sentinelSceneCount: sentinelResult.scenes.length,
+      sentinelDetectionCount: sentinelResult.detections.length,
+      cloudFreeWaterRatio: sentinelResult.cloudFreeWaterRatio,
+      modelVersion: weights.version,
+      routingStrategy: weights.routingStrategy,
     },
     graphEdges: edges.slice(0, 180),
     horizons,
     trajectories,
-    sentinelScenes,
+    sentinelScenes: sentinelResult.scenes,
+    sentinelDetections: sentinelResult.detections,
     vesselRoute: {
       origin: { lat: params.vesselLat, lon: params.vesselLon },
       speedKnots: params.vesselSpeedKnots,
@@ -937,5 +878,6 @@ export async function runRealMarinePrediction(params: PredictParams): Promise<Pr
       meanTargetConvergence,
       waypoints,
     },
+    fleetSimulation,
   };
 }

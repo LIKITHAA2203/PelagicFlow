@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
+import { Radio, RefreshCw } from 'lucide-react';
 import type {
   BasemapMode,
   HorizonKey,
@@ -7,17 +8,34 @@ import type {
   PredictionResponse,
 } from '../types/ocean';
 
+export type MapPickMode = 'none' | 'vessel' | 'feedback';
+
 interface OceanMapProps {
   prediction: PredictionResponse | null;
   activeHorizon: HorizonKey;
   layers: LayerVisibility;
   basemap: BasemapMode;
   bounds: { latMin: number; latMax: number; lonMin: number; lonMax: number };
-  pickVesselMode: boolean;
+  pickMode: MapPickMode;
+  loading: boolean;
   selectedWaypointOrder: number | null;
-  onPickVessel: (lat: number, lon: number) => void;
+  onPickCoordinate: (lat: number, lon: number, nearestPredicted?: number) => void;
   onSelectWaypoint: (order: number) => void;
+  onSyncNow: () => void;
 }
+
+function formatDataAge(ageSeconds: number): string {
+  const s = Math.max(0, Math.floor(ageSeconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const remS = s % 60;
+  if (m < 60) return `${m}m ${String(remS).padStart(2, '0')}s`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return `${h}h ${String(remM).padStart(2, '0')}m`;
+}
+
+const FLEET_COLORS = ['#34D399', '#A78BFA', '#F472B6', '#38BDF8'];
 
 function sstToColor(sst: number): string {
   const t = Math.max(0, Math.min(1, (sst - 10) / 20));
@@ -55,35 +73,68 @@ export function OceanMap({
   layers,
   basemap,
   bounds,
-  pickVesselMode,
+  pickMode,
+  loading,
   selectedWaypointOrder,
-  onPickVessel,
+  onPickCoordinate,
   onSelectWaypoint,
+  onSyncNow,
 }: OceanMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
   const tileLayerRef = useRef<L.TileLayer | null>(null);
   const sstLayerRef = useRef<L.LayerGroup | null>(null);
   const sentinelLayerRef = useRef<L.LayerGroup | null>(null);
+  const detectionLayerRef = useRef<L.LayerGroup | null>(null);
   const graphLayerRef = useRef<L.LayerGroup | null>(null);
   const plumeLayerRef = useRef<L.LayerGroup | null>(null);
   const trajectoryLayerRef = useRef<L.LayerGroup | null>(null);
   const currentLayerRef = useRef<L.LayerGroup | null>(null);
   const routeLayerRef = useRef<L.LayerGroup | null>(null);
+  const fleetLayerRef = useRef<L.LayerGroup | null>(null);
   const bboxLayerRef = useRef<L.LayerGroup | null>(null);
   const lastBoundsKeyRef = useRef<string>('');
 
   const [cursorCoords, setCursorCoords] = useState<{ lat: number; lon: number } | null>(null);
-  const pickModeRef = useRef(pickVesselMode);
-  const onPickVesselRef = useRef(onPickVessel);
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const [ingestBurstKey, setIngestBurstKey] = useState<number>(0);
+  const [ingestBurstActive, setIngestBurstActive] = useState<boolean>(false);
+  const lastIngestSigRef = useRef<string>('');
+  const pickModeRef = useRef<MapPickMode>(pickMode);
+  const onPickRef = useRef(onPickCoordinate);
+  const predictionRef = useRef(prediction);
+  const activeHorizonRef = useRef(activeHorizon);
 
   useEffect(() => {
-    pickModeRef.current = pickVesselMode;
-  }, [pickVesselMode]);
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
 
   useEffect(() => {
-    onPickVesselRef.current = onPickVessel;
-  }, [onPickVessel]);
+    if (!prediction) return;
+    const sig = `${prediction.meta.ingestedAtUtc}|${prediction.meta.sentinelDetectionCount}|${prediction.meta.modelVersion}`;
+    if (sig !== lastIngestSigRef.current) {
+      lastIngestSigRef.current = sig;
+      setNowMs(Date.now());
+      setIngestBurstKey((k) => k + 1);
+      setIngestBurstActive(true);
+      const timer = window.setTimeout(() => setIngestBurstActive(false), 3200);
+      return () => window.clearTimeout(timer);
+    }
+  }, [prediction]);
+
+  useEffect(() => {
+    pickModeRef.current = pickMode;
+  }, [pickMode]);
+
+  useEffect(() => {
+    onPickRef.current = onPickCoordinate;
+  }, [onPickCoordinate]);
+
+  useEffect(() => {
+    predictionRef.current = prediction;
+    activeHorizonRef.current = activeHorizon;
+  }, [prediction, activeHorizon]);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
@@ -104,9 +155,11 @@ export function OceanMap({
     graphLayerRef.current = L.layerGroup().addTo(map);
     bboxLayerRef.current = L.layerGroup().addTo(map);
     plumeLayerRef.current = L.layerGroup().addTo(map);
+    detectionLayerRef.current = L.layerGroup().addTo(map);
     trajectoryLayerRef.current = L.layerGroup().addTo(map);
     currentLayerRef.current = L.layerGroup().addTo(map);
     routeLayerRef.current = L.layerGroup().addTo(map);
+    fleetLayerRef.current = L.layerGroup().addTo(map);
 
     map.on('mousemove', (e: L.LeafletMouseEvent) => {
       setCursorCoords({ lat: e.latlng.lat, lon: e.latlng.lng });
@@ -117,12 +170,22 @@ export function OceanMap({
     });
 
     map.on('click', (e: L.LeafletMouseEvent) => {
-      if (pickModeRef.current) {
-        onPickVesselRef.current(
-          Number(e.latlng.lat.toFixed(3)),
-          Number(e.latlng.lng.toFixed(3))
-        );
+      if (pickModeRef.current === 'none') return;
+      const lat = Number(e.latlng.lat.toFixed(3));
+      const lon = Number(e.latlng.lng.toFixed(3));
+      let nearestConv: number | undefined;
+      const snap = predictionRef.current?.horizons[activeHorizonRef.current];
+      if (snap && snap.nodes.length > 0) {
+        let bestD = Infinity;
+        for (const n of snap.nodes) {
+          const d = (n.lat - lat) ** 2 + (n.lon - lon) ** 2;
+          if (d < bestD) {
+            bestD = d;
+            nearestConv = n.convergenceIndex;
+          }
+        }
       }
+      onPickRef.current(lat, lon, nearestConv);
     });
 
     mapRef.current = map;
@@ -153,8 +216,8 @@ export function OceanMap({
 
     const attribution =
       basemap === 'satellite'
-        ? 'Tiles &copy; Esri &mdash; Maxar | Ocean: Open-Meteo / Mercator'
-        : '&copy; OpenStreetMap &copy; CARTO | Ocean: Open-Meteo / Mercator';
+        ? 'Tiles &copy; Esri &mdash; Maxar | Ocean: Open-Meteo &amp; Sentinel-2 L2A'
+        : '&copy; OpenStreetMap &copy; CARTO | Ocean: Open-Meteo &amp; Sentinel-2 L2A';
 
     tileLayerRef.current = L.tileLayer(tileUrl, {
       attribution,
@@ -208,21 +271,37 @@ export function OceanMap({
   useEffect(() => {
     const sstGrp = sstLayerRef.current;
     const s2Grp = sentinelLayerRef.current;
+    const detGrp = detectionLayerRef.current;
     const graphGrp = graphLayerRef.current;
     const plumeGrp = plumeLayerRef.current;
     const trajGrp = trajectoryLayerRef.current;
     const curGrp = currentLayerRef.current;
     const routeGrp = routeLayerRef.current;
+    const fleetGrp = fleetLayerRef.current;
 
-    if (!sstGrp || !s2Grp || !graphGrp || !plumeGrp || !trajGrp || !curGrp || !routeGrp) return;
+    if (
+      !sstGrp ||
+      !s2Grp ||
+      !detGrp ||
+      !graphGrp ||
+      !plumeGrp ||
+      !trajGrp ||
+      !curGrp ||
+      !routeGrp ||
+      !fleetGrp
+    ) {
+      return;
+    }
 
     sstGrp.clearLayers();
     s2Grp.clearLayers();
+    detGrp.clearLayers();
     graphGrp.clearLayers();
     plumeGrp.clearLayers();
     trajGrp.clearLayers();
     curGrp.clearLayers();
     routeGrp.clearLayers();
+    fleetGrp.clearLayers();
 
     if (!prediction) return;
     const snapshot = prediction.horizons[activeHorizon];
@@ -247,17 +326,17 @@ export function OceanMap({
             weight: 0.5,
             opacity: 0.35,
             fillColor: color,
-            fillOpacity: 0.3,
+            fillOpacity: 0.28,
           }
         )
           .bindTooltip(
-            `Node #${n.id} · SST ${n.sst.toFixed(1)} °C · Wave ${n.waveHeight.toFixed(2)} m · Wind ${n.windSpeedMs.toFixed(1)} m/s`
+            `Node #${n.id} · SST ${n.sst.toFixed(1)} °C · Wave ${n.waveHeight.toFixed(2)} m · S2 FDI ${(n.s2FdiScore * 100).toFixed(0)}%`
           )
           .addTo(sstGrp);
       });
     }
 
-    // 2. Real Sentinel-2 L2A STAC Swath Footprints
+    // 2. Sentinel-2 L2A STAC Swath Footprints
     if (layers.sentinel && prediction.sentinelScenes.length > 0) {
       prediction.sentinelScenes.forEach((sc) => {
         const ring = sc.coordinates[0];
@@ -268,7 +347,7 @@ export function OceanMap({
           weight: 1.2,
           dashArray: '4,3',
           fillColor: '#A78BFA',
-          fillOpacity: 0.08,
+          fillOpacity: 0.06,
         })
           .bindTooltip(
             `Sentinel-2 L2A (${sc.mgrsTile}) · ${sc.datetime.slice(0, 16)}Z · Cloud ${sc.cloudCover}%`
@@ -277,7 +356,24 @@ export function OceanMap({
       });
     }
 
-    // 3. GNN Spatial Graph Topology Edges
+    // 3. Sentinel-2 Spectral FDI Detection Zones
+    if (layers.detections && prediction.sentinelDetections?.length > 0) {
+      prediction.sentinelDetections.forEach((det) => {
+        L.circleMarker([det.lat, det.lon], {
+          radius: 4 + det.confidence * 5,
+          color: '#FB7185',
+          weight: 1.4,
+          fillColor: '#F43F5E',
+          fillOpacity: 0.55,
+        })
+          .bindTooltip(
+            `S2 Spectral FDI ${det.fdi.toFixed(4)} · NDVI ${det.ndvi.toFixed(2)} · Conf ${(det.confidence * 100).toFixed(0)}% (${det.mgrsTile})`
+          )
+          .addTo(detGrp);
+      });
+    }
+
+    // 4. GNN Spatial Graph Topology Edges
     if (layers.graph) {
       prediction.graphEdges.forEach((e) => {
         const src = nodeById.get(e.source);
@@ -298,7 +394,7 @@ export function OceanMap({
       });
     }
 
-    // 4. Convergence / Accumulation Risk Nodes
+    // 5. Convergence / Plume Concentration Nodes
     if (layers.plume) {
       nodes.forEach((n) => {
         const cColor = convergenceToColor(n.convergenceIndex);
@@ -312,20 +408,18 @@ export function OceanMap({
           fillOpacity: 0.25 + n.convergenceIndex * 0.28,
         })
           .bindTooltip(
-            `Convergence ${(n.convergenceIndex * 100).toFixed(1)}% · Flow ${n.speedMs.toFixed(2)} m/s (${n.directionDeg.toFixed(0)}°) · Wind ${n.windSpeedMs.toFixed(1)} m/s · SST ${n.sst.toFixed(1)}°C`
+            `Convergence ${(n.convergenceIndex * 100).toFixed(1)}% · S2 FDI ${(n.s2FdiScore * 100).toFixed(0)}% · Flow ${n.speedMs.toFixed(2)} m/s · SST ${n.sst.toFixed(1)}°C`
           )
           .addTo(plumeGrp);
       });
     }
 
-    // 5. RK4 Drift Trajectories (0h -> 72h)
+    // 6. RK4 Drift Trajectories
     if (layers.trajectories) {
       const targetHour = Number(activeHorizon);
       prediction.trajectories.forEach((tr) => {
         const visiblePts =
-          targetHour === 0
-            ? tr.points
-            : tr.points.filter((p) => p.hour <= targetHour);
+          targetHour === 0 ? tr.points : tr.points.filter((p) => p.hour <= targetHour);
         const ptsToDraw = visiblePts.length >= 2 ? visiblePts : tr.points;
         L.polyline(
           ptsToDraw.map((p): [number, number] => [p.lat, p.lon]),
@@ -345,13 +439,15 @@ export function OceanMap({
             fillOpacity: 0.95,
             weight: 1,
           })
-            .bindTooltip(`RK4 Drifter #${tr.nodeId} · t+${tip.hour}h (${tip.lat.toFixed(2)}, ${tip.lon.toFixed(2)})`)
+            .bindTooltip(
+              `RK4 Drifter #${tr.nodeId} · t+${tip.hour}h (${tip.lat.toFixed(2)}, ${tip.lon.toFixed(2)})`
+            )
             .addTo(trajGrp);
         }
       });
     }
 
-    // 6. Ocean Current Velocity Vectors (u/v)
+    // 7. Ocean Current Velocity Vectors (u/v)
     if (layers.currents) {
       const vectorScale = 2.4;
       nodes.forEach((n) => {
@@ -395,7 +491,7 @@ export function OceanMap({
       });
     }
 
-    // 7. Cleanup Vessel Interception Route & Waypoints
+    // 8. Primary Vessel Interception Route & Waypoints
     if (layers.route) {
       const { origin, waypoints } = prediction.vesselRoute;
       const pathCoords: [number, number][] = [
@@ -454,18 +550,167 @@ export function OceanMap({
           .addTo(routeGrp);
       });
     }
+
+    // 9. Autonomous Cleanup Fleet Simulation Tracks
+    if (layers.fleet && prediction.fleetSimulation?.vessels?.length > 0) {
+      const targetHr = Number(activeHorizon);
+      prediction.fleetSimulation.vessels.forEach((v, idx) => {
+        const col = FLEET_COLORS[idx % FLEET_COLORS.length];
+        const pts =
+          targetHr === 0 ? v.track : v.track.filter((pt) => pt.hour <= targetHr);
+        const drawPts = pts.length >= 2 ? pts : v.track;
+
+        L.polyline(
+          drawPts.map((pt): [number, number] => [pt.lat, pt.lon]),
+          {
+            color: col,
+            weight: 2.2,
+            opacity: 0.9,
+          }
+        ).addTo(fleetGrp);
+
+        const pos = drawPts[drawPts.length - 1] || v.track[0];
+        if (pos) {
+          const usvIcon = L.divIcon({
+            className: '',
+            html: `<div style="padding:1px 5px;border-radius:3px;background:#070B12;border:1.5px solid ${col};color:${col};font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;white-space:nowrap;">${v.vesselId}</div>`,
+            iconSize: [42, 18],
+            iconAnchor: [21, 9],
+          });
+          L.marker([pos.lat, pos.lon], { icon: usvIcon })
+            .bindTooltip(
+              `${v.vesselId} (${v.vesselClass}) · t+${pos.hour}h · Captured ${pos.cumulativeCapturedKg} kg · Eff ${pos.captureEfficiencyPct}%`
+            )
+            .addTo(fleetGrp);
+        }
+      });
+    }
   }, [prediction, activeHorizon, layers, bounds, selectedWaypointOrder, onSelectWaypoint]);
 
   return (
     <div className="relative flex-1 min-h-[380px] bg-[#060910]">
       <div
         ref={containerRef}
-        className={`w-full h-full ${pickVesselMode ? 'cursor-crosshair' : ''}`}
+        className={`w-full h-full ${pickMode !== 'none' ? 'cursor-crosshair' : ''}`}
       />
 
-      {pickVesselMode && (
+      {/* Map Layer Real-Time Data Sync & Age Status Indicator */}
+      {(() => {
+        const ingestedMs = prediction?.meta.ingestedAtUtc
+          ? Date.parse(prediction.meta.ingestedAtUtc)
+          : NaN;
+        const ageSec = Number.isFinite(ingestedMs) ? Math.max(0, (nowMs - ingestedMs) / 1000) : null;
+        const freshness =
+          loading
+            ? 'ingesting'
+            : ingestBurstActive
+            ? 'synced'
+            : ageSec === null
+            ? 'idle'
+            : ageSec < 60
+            ? 'fresh'
+            : ageSec < 300
+            ? 'live'
+            : 'stale';
+
+        const accentBorder =
+          freshness === 'ingesting'
+            ? 'border-cyan-400/70'
+            : freshness === 'synced'
+            ? 'border-emerald-400/80 shadow-[0_0_20px_rgba(52,211,153,0.22)]'
+            : freshness === 'stale'
+            ? 'border-amber-500/50'
+            : 'border-slate-800';
+
+        const statusColor =
+          freshness === 'ingesting'
+            ? 'text-cyan-300'
+            : freshness === 'synced' || freshness === 'fresh'
+            ? 'text-emerald-300'
+            : freshness === 'stale'
+            ? 'text-amber-300'
+            : 'text-cyan-300';
+
+        const s2PassLabel = prediction?.meta.latestSentinelUtc
+          ? `${prediction.meta.latestSentinelUtc.slice(5, 16).replace('T', ' ')}Z`
+          : 'No swath';
+
+        return (
+          <div
+            className={`pointer-events-none absolute top-14 left-3 lg:top-3 z-[500] bg-[#070B12]/92 backdrop-blur-sm border ${accentBorder} rounded overflow-hidden transition-colors duration-300 max-w-[300px] sm:max-w-[340px]`}
+          >
+            {(loading || ingestBurstActive) && (
+              <div className="h-[2px] w-full bg-slate-800 overflow-hidden">
+                <div
+                  key={ingestBurstKey}
+                  className={`h-full w-1/2 ${
+                    loading ? 'bg-cyan-400 animate-sync-sweep' : 'bg-emerald-400 animate-sync-sweep'
+                  }`}
+                />
+              </div>
+            )}
+
+            <div className="px-2.5 py-1.5 flex items-center gap-2.5">
+              <div className="relative flex items-center justify-center w-5 h-5 shrink-0">
+                {ingestBurstActive && !loading && (
+                  <span
+                    key={`ring-${ingestBurstKey}`}
+                    className="absolute inset-0 rounded-full border border-emerald-400 animate-ingest-ring"
+                  />
+                )}
+                {loading ? (
+                  <RefreshCw className="w-3.5 h-3.5 text-cyan-400 animate-spin" />
+                ) : (
+                  <Radio
+                    className={`w-3.5 h-3.5 ${
+                      ingestBurstActive ? 'text-emerald-400 animate-pulse' : statusColor
+                    }`}
+                  />
+                )}
+              </div>
+
+              <div className="min-w-0 flex-1 text-[11px] font-mono leading-tight">
+                <div className="flex items-center gap-2">
+                  <span className={`font-semibold uppercase tracking-wide ${statusColor}`}>
+                    {loading
+                      ? 'Ingesting → GNN'
+                      : ingestBurstActive
+                      ? 'GNN Synced'
+                      : freshness === 'stale'
+                      ? 'Age Stale'
+                      : 'Telemetry Live'}
+                  </span>
+                  <span className="text-slate-600">·</span>
+                  <span className="text-slate-100">
+                    AGE {ageSec !== null ? formatDataAge(ageSec) : '—'}
+                  </span>
+                </div>
+                <div className="text-[10px] text-slate-400 truncate mt-0.5">
+                  {prediction
+                    ? `OM+${prediction.meta.nodeCount}N · S2 ${prediction.meta.sentinelDetectionCount} FDI (${s2PassLabel})`
+                    : 'Awaiting ocean & Sentinel-2 feed'}
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={onSyncNow}
+                disabled={loading}
+                title="Ingest fresh Open-Meteo & Sentinel-2 data now"
+                className="pointer-events-auto shrink-0 px-2 py-1 min-h-[28px] rounded border border-slate-700 bg-[#0E1522] text-[10px] font-mono text-slate-200 hover:border-cyan-500/60 hover:text-cyan-300 disabled:opacity-40 transition-colors"
+              >
+                {loading ? 'Sync...' : 'Sync'}
+              </button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {pickMode !== 'none' && (
         <div className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 z-[500] bg-[#0E1522]/95 border border-cyan-500/60 px-3 py-1.5 rounded text-xs font-mono text-cyan-300">
-          Click anywhere on the ocean map to reposition cleanup vessel origin
+          {pickMode === 'vessel'
+            ? 'Click ocean map to set cleanup vessel origin'
+            : 'Click ocean map to attach feedback coordinates'}
         </div>
       )}
 
@@ -501,13 +746,16 @@ export function OceanMap({
           </div>
         </div>
         <div className="flex items-center justify-between gap-4">
-          <span className="text-slate-400">Convergence</span>
-          <div className="flex items-center gap-2">
+          <span className="text-slate-400">Layers</span>
+          <div className="flex items-center gap-2.5">
             <span className="inline-flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-[#0EA5E9]" /> Low
+              <span className="w-2 h-2 rounded-full bg-[#F59E0B]" /> Conv
             </span>
             <span className="inline-flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-[#F59E0B]" /> High
+              <span className="w-2 h-2 rounded-full bg-[#F43F5E]" /> S2 FDI
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-[#34D399]" /> Fleet
             </span>
           </div>
         </div>

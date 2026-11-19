@@ -10,8 +10,10 @@ import {
   RefreshCw,
   SlidersHorizontal,
 } from 'lucide-react';
+import { FeedbackPanel } from './components/FeedbackPanel';
+import { FleetPanel } from './components/FleetPanel';
 import { ForecastChart } from './components/ForecastChart';
-import { OceanMap } from './components/OceanMap';
+import { OceanMap, type MapPickMode } from './components/OceanMap';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { PyGCodeModal } from './components/PyGCodeModal';
@@ -21,6 +23,7 @@ import type {
   HorizonKey,
   LayerVisibility,
   PredictionResponse,
+  VesselClassId,
 } from './types/ocean';
 
 const HORIZONS: HorizonKey[] = ['0', '24', '48', '72'];
@@ -55,12 +58,24 @@ export default function App() {
   const [vesselLat, setVesselLat] = useState<string>('33.2');
   const [vesselLon, setVesselLon] = useState<string>('-149.5');
   const [vesselSpeedKnots, setVesselSpeedKnots] = useState<string>('10');
-  const [pickVesselMode, setPickVesselMode] = useState<boolean>(false);
+
+  const [fleetSize, setFleetSize] = useState<number>(2);
+  const [vesselClass, setVesselClass] = useState<VesselClassId>('autonomous_sweeper');
+  const [simLoading, setSimLoading] = useState<boolean>(false);
+
+  const [pickMode, setPickMode] = useState<MapPickMode>('none');
+  const [feedbackPickedCoords, setFeedbackPickedCoords] = useState<{
+    lat: number;
+    lon: number;
+    predictedIndex?: number;
+  } | null>(null);
 
   const [activeHorizon, setActiveHorizon] = useState<HorizonKey>('24');
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [basemap, setBasemap] = useState<BasemapMode>('satellite');
-  const [bottomTab, setBottomTab] = useState<'waypoints' | 'chart' | 'provenance'>('waypoints');
+  const [bottomTab, setBottomTab] = useState<
+    'waypoints' | 'fleet' | 'chart' | 'feedback' | 'provenance'
+  >('waypoints');
   const [mobilePane, setMobilePane] = useState<'map' | 'controls' | 'data'>('map');
   const [selectedWaypointOrder, setSelectedWaypointOrder] = useState<number | null>(null);
   const [codeModalOpen, setCodeModalOpen] = useState<boolean>(false);
@@ -73,6 +88,8 @@ export default function App() {
     graph: true,
     route: true,
     sentinel: true,
+    detections: true,
+    fleet: true,
   });
 
   const [apiHealth, setApiHealth] = useState<{
@@ -97,6 +114,8 @@ export default function App() {
         vesselLon: number;
         vesselSpeedKnots: number;
         leewayFactor: number;
+        fleetSize: number;
+        vesselClass: VesselClassId;
         forceRefresh: boolean;
       }>
     ) => {
@@ -113,6 +132,8 @@ export default function App() {
         vesselSpeedKnots: override?.vesselSpeedKnots ?? parseFloat(vesselSpeedKnots),
         leewayFactor:
           override?.leewayFactor ?? (Number.isFinite(parsedLeeway) ? parsedLeeway / 100 : 0.02),
+        fleetSize: override?.fleetSize ?? fleetSize,
+        vesselClass: override?.vesselClass ?? vesselClass,
         forceRefresh: override?.forceRefresh ?? false,
       };
 
@@ -166,6 +187,8 @@ export default function App() {
       vesselLon,
       vesselSpeedKnots,
       leewayPct,
+      fleetSize,
+      vesselClass,
     ]
   );
 
@@ -254,15 +277,48 @@ export default function App() {
     });
   };
 
-  const handlePickVessel = useCallback(
-    (lat: number, lon: number) => {
-      setVesselLat(String(lat));
-      setVesselLon(String(lon));
-      setPickVesselMode(false);
-      runForecast({ vesselLat: lat, vesselLon: lon });
+  const handleMapPickCoordinate = useCallback(
+    (lat: number, lon: number, nearestPredicted?: number) => {
+      if (pickMode === 'vessel') {
+        setVesselLat(String(lat));
+        setVesselLon(String(lon));
+        setPickMode('none');
+        runForecast({ vesselLat: lat, vesselLon: lon });
+      } else if (pickMode === 'feedback') {
+        setFeedbackPickedCoords({ lat, lon, predictedIndex: nearestPredicted });
+        setPickMode('none');
+        setBottomTab('feedback');
+        setMobilePane('data');
+      }
     },
-    [runForecast]
+    [pickMode, runForecast]
   );
+
+  const handleRunFleetSimOnly = async (nextSize?: number, nextClass?: VesselClassId) => {
+    if (!prediction) return;
+    setSimLoading(true);
+    try {
+      const res = await fetch('/api/simulate-fleet', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fleetSize: nextSize ?? fleetSize,
+          vesselClass: nextClass ?? vesselClass,
+          horizonHours: 72,
+          originLat: parseFloat(vesselLat),
+          originLon: parseFloat(vesselLon),
+          horizons: prediction.horizons,
+          waypoints: prediction.vesselRoute.waypoints,
+        }),
+      });
+      if (res.ok) {
+        const sim = await res.json();
+        setPrediction((prev) => (prev ? { ...prev, fleetSimulation: sim } : prev));
+      }
+    } finally {
+      setSimLoading(false);
+    }
+  };
 
   const handleExportGeoJSON = () => {
     if (!prediction) return;
@@ -281,6 +337,18 @@ export default function App() {
           sstC: n.sst,
           waveHeightM: n.waveHeight,
           convergenceIndex: n.convergenceIndex,
+          s2FdiScore: n.s2FdiScore,
+        },
+      })),
+      ...prediction.sentinelDetections.map((det) => ({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [det.lon, det.lat] },
+        properties: {
+          kind: 'sentinel2_fdi_detection',
+          fdi: det.fdi,
+          ndvi: det.ndvi,
+          confidence: det.confidence,
+          mgrsTile: det.mgrsTile,
         },
       })),
       ...prediction.trajectories.map((tr) => ({
@@ -344,7 +412,7 @@ export default function App() {
 
   return (
     <div className="h-[100dvh] flex flex-col bg-[#070B12] text-slate-100 overflow-hidden">
-      {/* Top Telemetry Ribbon (48px) */}
+      {/* Top Telemetry Ribbon */}
       <header className="h-12 shrink-0 px-3 sm:px-4 lg:px-5 border-b border-slate-800 bg-[#0B111C] flex items-center justify-between gap-3">
         <div className="flex items-center gap-3 min-w-0">
           <span className="text-base font-semibold tracking-tight text-slate-100 whitespace-nowrap shrink-0">
@@ -362,7 +430,7 @@ export default function App() {
                 ·
               </span>
               <span className="hidden md:inline text-xs font-mono text-slate-400 whitespace-nowrap">
-                UTC {prediction.meta.forecastIssuedUtc.replace('T', ' ')}
+                UTC {prediction.meta.forecastIssuedUtc.replace('T', ' ')} · v{prediction.meta.modelVersion}
               </span>
             </>
           )}
@@ -434,7 +502,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Workspace (Responsive Desktop Split Console / Mobile Tabbed App) */}
+      {/* Main Workspace */}
       <div className="flex-1 min-h-0 flex flex-col lg:flex-row pb-14 lg:pb-0">
         {/* Left Control & Parameter Column */}
         <aside
@@ -442,7 +510,6 @@ export default function App() {
             mobilePane === 'controls' ? 'flex' : 'hidden'
           } lg:flex w-full lg:w-[348px] flex-1 lg:flex-none shrink-0 bg-[#0E1522] border-b lg:border-b-0 lg:border-r border-slate-800 p-4 overflow-y-auto flex-col gap-4`}
         >
-          {/* 1. Zone Selection */}
           <section className="space-y-2">
             <div className="flex items-center justify-between">
               <label htmlFor="zone-select" className="text-xs font-medium text-slate-300">
@@ -474,7 +541,6 @@ export default function App() {
 
           <hr className="border-slate-800/80" />
 
-          {/* 2. Geographic Bounding Box */}
           <section className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-xs font-medium text-slate-300">Bounding Coordinates</span>
@@ -570,7 +636,6 @@ export default function App() {
 
           <hr className="border-slate-800/80" />
 
-          {/* 3. Drift Forecast Horizon */}
           <section className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-xs font-medium text-slate-300">Drift Forecast Horizon</span>
@@ -606,7 +671,6 @@ export default function App() {
 
           <hr className="border-slate-800/80" />
 
-          {/* 4. Layer Visibility */}
           <section className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-xs font-medium text-slate-300">Geospatial Layers</span>
@@ -627,7 +691,9 @@ export default function App() {
                   ['trajectories', 'RK4 Drift Paths'],
                   ['graph', 'GNN Graph'],
                   ['route', 'Vessel Route'],
-                  ['sentinel', 'Sentinel-2 Swaths'],
+                  ['sentinel', 'S2 Swaths'],
+                  ['detections', 'S2 FDI Plumes'],
+                  ['fleet', 'Fleet Tracks'],
                 ] as Array<[keyof LayerVisibility, string]>
               ).map(([key, label]) => {
                 const active = layers[key];
@@ -636,7 +702,7 @@ export default function App() {
                     key={key}
                     type="button"
                     onClick={() => toggleLayer(key)}
-                    className={`min-h-[38px] px-2.5 py-1.5 rounded border text-left text-[11px] transition-colors flex items-center justify-between ${
+                    className={`min-h-[36px] px-2.5 py-1 rounded border text-left text-[11px] transition-colors flex items-center justify-between ${
                       active
                         ? 'bg-[#070B12] border-cyan-500/50 text-slate-100'
                         : 'bg-[#070B12]/40 border-slate-800 text-slate-500 hover:text-slate-300'
@@ -658,24 +724,23 @@ export default function App() {
 
           <hr className="border-slate-800/80" />
 
-          {/* 5. Cleanup Vessel & Windage Parameters */}
           <section className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-xs font-medium text-slate-300">Vessel &amp; Wind Leeway</span>
               <button
                 type="button"
                 onClick={() => {
-                  setPickVesselMode((m) => !m);
+                  setPickMode((m) => (m === 'vessel' ? 'none' : 'vessel'));
                   setMobilePane('map');
                 }}
                 className={`inline-flex items-center gap-1 px-2.5 py-1 rounded text-[11px] border transition-colors ${
-                  pickVesselMode
+                  pickMode === 'vessel'
                     ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300'
                     : 'border-slate-700 text-slate-300 hover:border-slate-500'
                 }`}
               >
                 <Crosshair className="w-3 h-3" />
-                <span>{pickVesselMode ? 'Cancel Pick' : 'Pick on Map'}</span>
+                <span>{pickMode === 'vessel' ? 'Cancel Pick' : 'Pick on Map'}</span>
               </button>
             </div>
             <div className="grid grid-cols-2 gap-2">
@@ -774,13 +839,11 @@ export default function App() {
             mobilePane !== 'controls' ? 'flex' : 'hidden'
           } lg:flex flex-1 min-w-0 min-h-0 flex-col`}
         >
-          {/* Map Wrapper (full screen on mobile Map tab, flex-1 on desktop) */}
           <div
             className={`${
               mobilePane === 'map' ? 'flex' : 'hidden'
             } lg:flex flex-1 min-h-0 flex-col relative`}
           >
-            {/* Mobile Compact Horizon Overlay Pill Strip on Map */}
             <div className="lg:hidden absolute top-3 left-3 z-[500] flex items-center gap-1 bg-[#070B12]/90 border border-slate-800 rounded p-1">
               {HORIZONS.map((h) => (
                 <button
@@ -807,21 +870,22 @@ export default function App() {
               layers={layers}
               basemap={basemap}
               bounds={numericBounds}
-              pickVesselMode={pickVesselMode}
+              pickMode={pickMode}
+              loading={loading}
               selectedWaypointOrder={selectedWaypointOrder}
-              onPickVessel={handlePickVessel}
+              onPickCoordinate={handleMapPickCoordinate}
               onSelectWaypoint={(order) => setSelectedWaypointOrder(order)}
+              onSyncNow={() => runForecast({ forceRefresh: true })}
             />
           </div>
 
-          {/* Bottom Telemetry & Interception Tray (full pane on mobile Data tab, 246px tray on desktop) */}
           <section
             className={`${
               mobilePane === 'data' ? 'flex flex-1' : 'hidden'
-            } lg:flex lg:flex-none shrink-0 lg:h-[246px] bg-[#0B111C] border-t border-slate-800 flex-col min-h-0`}
+            } lg:flex lg:flex-none shrink-0 lg:h-[268px] bg-[#0B111C] border-t border-slate-800 flex-col min-h-0`}
           >
             <div className="px-4 py-2 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
-              <div className="flex flex-wrap items-center gap-4 sm:gap-5 text-xs font-mono">
+              <div className="flex flex-wrap items-center gap-4 text-xs font-mono">
                 <div>
                   <span className="text-slate-500 mr-1.5">Current</span>
                   <span className="text-cyan-300 font-semibold">
@@ -841,53 +905,44 @@ export default function App() {
                   </span>
                 </div>
                 <div>
-                  <span className="text-slate-500 mr-1.5">Conv</span>
-                  <span className="text-amber-300 font-semibold">
-                    {activeSnapshot ? `${(activeSnapshot.peakConvergence * 100).toFixed(1)}%` : '—'}
+                  <span className="text-slate-500 mr-1.5">S2 FDI</span>
+                  <span className="text-rose-300 font-semibold">
+                    {prediction ? `${prediction.meta.sentinelDetectionCount} zones` : '—'}
                   </span>
                 </div>
                 <div className="hidden xl:block">
-                  <span className="text-slate-500 mr-1.5">S2 Swaths</span>
-                  <span className="text-violet-300 font-semibold">
-                    {prediction ? `${prediction.meta.sentinelSceneCount} scenes` : '—'}
+                  <span className="text-slate-500 mr-1.5">Fleet Capture</span>
+                  <span className="text-emerald-300 font-semibold">
+                    {prediction
+                      ? `${prediction.fleetSimulation.summary.cleanupSuccessRatePct}% (${prediction.fleetSimulation.summary.totalCapturedKg} kg)`
+                      : '—'}
                   </span>
                 </div>
               </div>
 
-              <div className="flex items-center gap-1 p-0.5 bg-[#070B12] border border-slate-800 rounded">
-                <button
-                  type="button"
-                  onClick={() => setBottomTab('waypoints')}
-                  className={`px-2.5 sm:px-3 py-1 text-xs rounded-sm transition-colors whitespace-nowrap ${
-                    bottomTab === 'waypoints'
-                      ? 'bg-slate-800 text-slate-100 font-medium'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  Waypoints
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setBottomTab('chart')}
-                  className={`px-2.5 sm:px-3 py-1 text-xs rounded-sm transition-colors whitespace-nowrap ${
-                    bottomTab === 'chart'
-                      ? 'bg-slate-800 text-slate-100 font-medium'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  72h Flow
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setBottomTab('provenance')}
-                  className={`px-2.5 sm:px-3 py-1 text-xs rounded-sm transition-colors whitespace-nowrap ${
-                    bottomTab === 'provenance'
-                      ? 'bg-slate-800 text-slate-100 font-medium'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  Provenance
-                </button>
+              <div className="flex flex-wrap items-center gap-1 p-0.5 bg-[#070B12] border border-slate-800 rounded">
+                {(
+                  [
+                    ['waypoints', 'Waypoints'],
+                    ['fleet', 'Fleet Sim'],
+                    ['chart', '72h Flow'],
+                    ['feedback', 'Feedback & Tune'],
+                    ['provenance', 'Provenance'],
+                  ] as const
+                ).map(([tabKey, label]) => (
+                  <button
+                    key={tabKey}
+                    type="button"
+                    onClick={() => setBottomTab(tabKey)}
+                    className={`px-2.5 py-1 text-xs rounded-sm transition-colors whitespace-nowrap ${
+                      bottomTab === tabKey
+                        ? 'bg-slate-800 text-slate-100 font-medium'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
               </div>
             </div>
 
@@ -895,7 +950,7 @@ export default function App() {
               {!prediction ? (
                 <div className="h-full flex items-center justify-center text-xs font-mono text-slate-400 py-8">
                   {loading
-                    ? 'Fetching real-time ocean currents, SST, 10m winds, and Sentinel-2 STAC passes...'
+                    ? 'Ingesting Open-Meteo currents, 10m winds, Sentinel-2 L2A COG spectral bands & running fleet sim...'
                     : 'No telemetry loaded. Click Run GNN Forecast.'}
                 </div>
               ) : bottomTab === 'waypoints' ? (
@@ -926,25 +981,41 @@ export default function App() {
                               isSelected ? 'bg-cyan-500/10' : 'hover:bg-slate-800/40'
                             }`}
                           >
-                            <td className="py-2.5 pr-4 font-semibold text-amber-300">
+                            <td className="py-2 pr-4 font-semibold text-amber-300">
                               WP #{wp.order}
                             </td>
-                            <td className="py-2.5 pr-4 text-slate-300">t+{wp.horizonHour}h</td>
-                            <td className="py-2.5 pr-4 text-slate-200">{wp.lat.toFixed(4)}°</td>
-                            <td className="py-2.5 pr-4 text-slate-200">{wp.lon.toFixed(4)}°</td>
-                            <td className="py-2.5 pr-4 text-amber-300">
+                            <td className="py-2 pr-4 text-slate-300">t+{wp.horizonHour}h</td>
+                            <td className="py-2 pr-4 text-slate-200">{wp.lat.toFixed(4)}°</td>
+                            <td className="py-2 pr-4 text-slate-200">{wp.lon.toFixed(4)}°</td>
+                            <td className="py-2 pr-4 text-amber-300">
                               {(wp.convergenceIndex * 100).toFixed(1)}%
                             </td>
-                            <td className="py-2.5 pr-4 text-cyan-300">
+                            <td className="py-2 pr-4 text-cyan-300">
                               {wp.legDistanceNm} nm · {wp.bearingDeg}°
                             </td>
-                            <td className="py-2.5 text-slate-100">{wp.etaHours} hrs</td>
+                            <td className="py-2 text-slate-100">{wp.etaHours} hrs</td>
                           </tr>
                         );
                       })}
                     </tbody>
                   </table>
                 </div>
+              ) : bottomTab === 'fleet' ? (
+                <FleetPanel
+                  simulation={prediction.fleetSimulation}
+                  fleetSize={fleetSize}
+                  vesselClass={vesselClass}
+                  loading={simLoading}
+                  onChangeFleetSize={(sz) => {
+                    setFleetSize(sz);
+                    handleRunFleetSimOnly(sz, vesselClass);
+                  }}
+                  onChangeVesselClass={(vc) => {
+                    setVesselClass(vc);
+                    handleRunFleetSimOnly(fleetSize, vc);
+                  }}
+                  onRunSimulation={() => handleRunFleetSimOnly()}
+                />
               ) : bottomTab === 'chart' ? (
                 <ForecastChart
                   prediction={prediction}
@@ -954,34 +1025,45 @@ export default function App() {
                     setActiveHorizon(h);
                   }}
                 />
+              ) : bottomTab === 'feedback' ? (
+                <FeedbackPanel
+                  regionId={selectedZoneId}
+                  pickedCoords={feedbackPickedCoords}
+                  pickActive={pickMode === 'feedback'}
+                  onTogglePickMode={() => {
+                    setPickMode((m) => (m === 'feedback' ? 'none' : 'feedback'));
+                    if (pickMode !== 'feedback') setMobilePane('map');
+                  }}
+                  onModelFineTuned={() => runForecast({ forceRefresh: false })}
+                />
               ) : (
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 text-xs leading-relaxed">
                   <div className="border border-slate-800 bg-[#070B12] rounded p-3 space-y-1.5">
                     <div className="font-mono text-[11px] text-cyan-300 uppercase">
-                      Live Direct Observations
+                      Live Multi-Sensor Ingestion
                     </div>
                     <ul className="text-slate-300 space-y-1">
-                      <li>· Ocean Currents (u/v) &amp; SST: Open-Meteo Marine (Mercator Ocean)</li>
+                      <li>· Currents, SST &amp; Waves: Open-Meteo Marine (Mercator)</li>
                       <li>· 10m Wind Leeway ({(prediction.meta.leewayFactor * 100).toFixed(1)}%): Open-Meteo Forecast</li>
-                      <li>· Sentinel-2 L2A Swaths: Element84 STAC ({prediction.meta.sentinelSceneCount} scenes in bbox)</li>
+                      <li>· Sentinel-2 L2A COG Bands (B04/B06/B08/B11/SCL): {prediction.meta.sentinelSceneCount} swaths, {prediction.meta.sentinelDetectionCount} FDI zones</li>
                     </ul>
                   </div>
                   <div className="border border-slate-800 bg-[#070B12] rounded p-3 space-y-1.5">
                     <div className="font-mono text-[11px] text-amber-300 uppercase">
-                      Physics &amp; Graph Modeling
+                      GNN Fusion &amp; Fleet Physics
                     </div>
                     <ul className="text-slate-300 space-y-1">
-                      <li>· Convergence Index: Derived from -div(u_eff), SST fronts &amp; stagnation</li>
-                      <li>· Trajectory Engine: 4th-Order Runge-Kutta + 1.5% Stokes + Windage</li>
-                      <li>· Route Total: {prediction.vesselRoute.totalDistanceNm} nm · {prediction.vesselRoute.totalEtaHours} hrs</li>
+                      <li>· Model Version: v{prediction.meta.modelVersion} ({prediction.meta.routingStrategy} routing)</li>
+                      <li>· Cloud-free water sampled: {(prediction.meta.cloudFreeWaterRatio * 100).toFixed(1)}%</li>
+                      <li>· 72h Fleet Capture: {prediction.fleetSimulation.summary.totalCapturedKg} kg · ${prediction.fleetSimulation.summary.totalOperationalCostUsd.toLocaleString()}</li>
                     </ul>
                   </div>
                   <div className="border border-slate-800 bg-[#070B12] rounded p-3 space-y-1.5">
                     <div className="font-mono text-[11px] text-slate-300 uppercase">
-                      Operational Calibration Note
+                      Calibration &amp; Feedback Loop
                     </div>
                     <p className="text-slate-400">
-                      Open-Meteo does not directly sense plastic tonnage. Use Convergence Index and RK4 drift paths to target high-probability trapping fronts; confirm surface debris optically using Sentinel-2 FDI bands or vessel observation.
+                      Sentinel-2 spectral FDI detections are spatially aligned onto ocean current graph nodes. Field observations logged in Feedback &amp; Tune update GNN fusion weights and routing penalties both on demand and on the 5-minute periodic loop.
                     </p>
                   </div>
                 </div>
@@ -991,7 +1073,7 @@ export default function App() {
         </main>
       </div>
 
-      {/* Mobile Fixed Thumb-Zone Bottom Tab Bar (56px, visible on < lg screens) */}
+      {/* Mobile Fixed Thumb-Zone Bottom Tab Bar */}
       <nav
         aria-label="Mobile Navigation"
         className="lg:hidden fixed bottom-0 left-0 right-0 z-[900] h-14 bg-[#0B111C]/95 backdrop-blur-md border-t border-slate-800 grid grid-cols-3 items-center"

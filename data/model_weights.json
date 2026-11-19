@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "lastTrainedAt": null,
+  "trainingRuns": 0,
+  "feedbackSamplesTrained": 0,
+  "lastTrainMseBefore": null,
+  "lastTrainMseAfter": null,
+  "wConvergence": 0.5,
+  "wSstFront": 0.22,
+  "wStagnation": 0.18,
+  "wSentinelFdi": 0.28,
+  "leewayCalibrationScale": 1,
+  "gnnAdvectionMix": 0.36,
+  "routingStrategy": "balanced",
+  "routeYieldWeight": 1,
+  "routeDistancePenalty": 0.15,
+  "routeHorizonPenaltyWeight": 1
+}

@@ -75,6 +75,34 @@
   border-bottom-color: #1e293b !important;
 }
 
+@keyframes sync-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(220%);
+  }
+}
+
+@keyframes ingest-pulse-ring {
+  0% {
+    transform: scale(0.82);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scale(2.1);
+    opacity: 0;
+  }
+}
+
+.animate-sync-sweep {
+  animation: sync-sweep 1.25s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.animate-ingest-ring {
+  animation: ingest-pulse-ring 1.15s cubic-bezier(0.16, 1, 0.3, 1) 2 forwards;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     animation-duration: 0.01ms !important;
